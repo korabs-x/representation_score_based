@@ -1,0 +1,14 @@
+module load cuda/11.0
+echo $LD_LIBRARY_PATH
+
+
+#XLA_FLAGS=--xla_gpu_cuda_data_dir=/is/software/nvidia/cuda-11.0/ /usr/bin/python3 main.py --config=configs/ddpmpp/my_cifar_large_continuous_ve.py --workdir=/home/kabstreiter/score_sde --mode=eval --config.training.batch_size=64 --config.training.snapshot_freq=10000 --config.training.n_iters=400000 --config.eval.begin_ckpt=30 --config.eval.end_ckpt=100 --config.training.experiment_name=ve_clarge_t60_kl1e-4 --config.model.single_t100=60 --config.model.lambda_z_sh=1e-4
+#XLA_FLAGS=--xla_gpu_cuda_data_dir=/is/software/nvidia/cuda-11.0/ /usr/bin/python3 main.py --config=configs/ddpmpp/my_cifar_large_continuous_ve.py --workdir=/home/kabstreiter/score_sde --mode=both --config.training.batch_size=64 --config.training.snapshot_freq=10000 --config.training.n_iters=100000 --config.eval.begin_ckpt=1 --config.eval.end_ckpt=10 --config.training.experiment_name=ve_cstruc_t$2_det$3_lam$4_$1 --config.model.deterministic_latent_input=$3 --config.model.single_t100=$2 --config.model.lambda_z_sh=$4
+#XLA_FLAGS=--xla_gpu_cuda_data_dir=/is/software/nvidia/cuda-11.0/ /usr/bin/python3 main.py --config=configs/ddpmpp/my_cifar_large_continuous_ve.py --workdir=/home/kabstreiter/score_sde --mode=eval --config.training.batch_size=64 --config.training.snapshot_freq=10000 --config.training.n_iters=100000 --config.eval.begin_ckpt=10 --config.eval.end_ckpt=10 --config.training.experiment_name=ve_cstruc_tstd$2_det$3_lam$4_$1 --config.model.deterministic_latent_input=$3 --config.model.uniform_std_sampling=$2 --config.model.lambda_z_sh=$4 --config.eval.enable_sampling=True
+# XLA_FLAGS=--xla_gpu_cuda_data_dir=/is/software/nvidia/cuda-11.0/ /usr/bin/python3 main.py --config=configs/ddpmpp/my_cifar_large_continuous_ve.py --workdir=/home/kabstreiter/score_sde --mode=both --config.training.batch_size=64 --config.training.snapshot_freq=10000 --config.training.n_iters=300000 --config.eval.begin_ckpt=30 --config.eval.end_ckpt=30 --config.training.experiment_name=ve_cstruc_tstd$2_det$3_lam$4_$1 --config.model.deterministic_latent_input=$3 --config.model.lambda_z_sh=$4 --config.eval.enable_sampling=True --config.model.frozen_encoder=True --config.model.uniform_std_sampling=False
+
+# XLA_FLAGS=--xla_gpu_cuda_data_dir=/is/software/nvidia/cuda-11.0/ /usr/bin/python3 main.py --config=configs/ncsnpp/cifar10_deep_continuous_ve.py --workdir=/home/kabstreiter/score_sde --mode=both --config.training.start_checkpoint_dir=checkpoints_pretrained_ve_c10 --config.training.experiment_name=pre_ve_lm_sam-$2_$1 --config.model.include_lambda_model=True --config.training.lambda_method_sampling=$2 --config.eval.num_samples=19999
+XLA_FLAGS=--xla_gpu_cuda_data_dir=/is/software/nvidia/cuda-11.0/ /usr/bin/python3 main.py --config=configs/ncsnpp/cifar10_deep_continuous_ve.py --workdir=/home/kabstreiter/score_sde --mode=eval --config.eval.eval_dir_postfix=_$1 --config.eval.begin_ckpt=12 --config.eval.end_ckpt=12
+
+
+
