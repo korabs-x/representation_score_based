@@ -10,7 +10,7 @@ This repository contains the information to reproduce the results for representa
 For data preparation and environment setup we refer to the descriptions in the above listed codebases, which can also be found in the readme files in the respective directories of this repository.
 
 ### Representation Learning
-The following command learns a time-dependent encoding using a probabilistic encoder on CIFAR-10:
+The following command learns a time-dependent encoding using a probabilistic encoder on CIFAR-10:<br>
 `python3 main.py 
 --config=configs/ve/cifar10_ncsnpp_small_continuous.py 
 --workdir=/path/to/score_sde_pytorch 
@@ -26,7 +26,7 @@ The following command learns a time-dependent encoding using a probabilistic enc
 --config.training.snapshot_freq=70000`
 
 ### Application to semi-supervised image classification (LaplaceNet)
-To train the semi-supervised classification model starting from the pretrained encoder from above, execute the following command:
+To train the semi-supervised classification model starting from the pretrained encoder from above, execute the following command:<br>
 `python3 main.py 
 --num-labeled 100 
 --ckpt ../score_sde_pytorch/checkpointsenc_ repr_cifar10/encoder_state_1.pth 
@@ -36,7 +36,7 @@ To train the semi-supervised classification model starting from the pretrained e
 --load_ckpt 1 
 --max_epochs 1000 
 --model wrn-28-2 
---alpha 1.0 --lr 0.03 --labeled-batch-size 50 --batch-size 100 --aug-num 3 --label-split 12 --progress False`
+--alpha 1.0 --lr 0.03 --labeled-batch-size 50 --batch-size 100 --aug-num 3 --label-split 12 --progress False`<br>
 A checkpoint is updated after every epoch and training is resumed automatically when executing the same command again.
 
 
