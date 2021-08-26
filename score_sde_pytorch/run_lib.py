@@ -40,6 +40,8 @@ import torch
 # from torch.utils import tensorboard
 from torchvision.utils import make_grid, save_image
 from utils import save_checkpoint, restore_checkpoint
+from collections import defaultdict
+import matplotlib.pyplot as plt
 
 from config import datasets as datasets_new
 from config import cli
@@ -61,15 +63,15 @@ def train(config, workdir):
     logging.info(tf.config.list_physical_devices('GPU'))
 
     # Create directories for experimental logs
-    sample_dir = os.path.join(workdir, "samples")
+    sample_dir = os.path.join(workdir, f"samples_{config.training.experiment_name}")
     tf.io.gfile.makedirs(sample_dir)
 
     # tb_dir = os.path.join(workdir, "tensorboard")
     # tf.io.gfile.makedirs(tb_dir)
     # writer = tensorboard.SummaryWriter(tb_dir)
 
-    use_new_dataloader = True
-    if not use_new_dataloader:
+    use_laplacenet_dataloader = True
+    if not use_laplacenet_dataloader:
         # Build data iterators
         train_ds, eval_ds, _ = datasets.get_dataset(config,
                                                     uniform_dequantization=config.data.uniform_dequantization)
@@ -108,6 +110,21 @@ def train(config, workdir):
         eval_iter = iter(cycle(eval_loader, False))
         scaler = lambda x: x
         inverse_scaler = lambda x: x
+
+        if not config.data.dataset == 'cifar10' and config.training.snapshot_sampling:
+            raise Exception(f'snapshot_sampling not supported for dataset {config.data.dataset}')
+
+        def inverse_normalize(tensor, c_mean=[0.4914, 0.4822, 0.4465], c_std=[0.2470, 0.2435, 0.2616]):
+            c_mean = torch.as_tensor(c_mean, dtype=tensor.dtype, device=tensor.device)
+            c_std = torch.as_tensor(c_std, dtype=tensor.dtype, device=tensor.device)
+            if c_mean.ndim == 1:
+                c_mean = c_mean.view(-1, 1, 1)
+            if c_std.ndim == 1:
+                c_std = c_std.view(-1, 1, 1)
+            # tensor.mul_(c_std).add_(c_mean)
+            return tensor * c_std + c_mean
+
+        inverse_scaler = inverse_normalize
 
     # Initialize model.
     score_model = mutils.create_model(config)
@@ -165,14 +182,44 @@ def train(config, workdir):
     # In case there are multiple hosts (e.g., TPU pods), only log to host 0
     logging.info("Starting training loop at step %d." % (initial_step,))
 
+    if False and config.training.snapshot_sampling:
+        step = initial_step
+        ema.store(score_model.parameters())
+        ema.copy_to(score_model.parameters())
+        sample, n = sampling_fn(score_model)
+        ema.restore(score_model.parameters())
+        this_sample_dir = os.path.join(sample_dir, "iter_{}".format(step))
+        tf.io.gfile.makedirs(this_sample_dir)
+        nrow = int(np.sqrt(sample.shape[0]))
+        image_grid = make_grid(sample, nrow, padding=2)
+        sample = np.clip(sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        with tf.io.gfile.GFile(
+                os.path.join(this_sample_dir, "sample.np"), "wb") as fout:
+            np.save(fout, image_grid)  # sample)
+
+        with tf.io.gfile.GFile(
+                os.path.join(this_sample_dir, "sample.png"), "wb") as fout:
+            save_image(image_grid, fout)
+        raise Exception()
+
     for step in range(initial_step, num_train_steps + 1):
         # Convert data to JAX arrays and normalize them. Use ._numpy() to avoid copy.
-        if use_new_dataloader:
+        if use_laplacenet_dataloader:
             images, labels = next(train_iter)
             batch = images.to(config.device)
         else:
             batch = torch.from_numpy(next(train_iter)['image']._numpy()).to(config.device).float()
             batch = batch.permute(0, 3, 1, 2)
+            if True:
+                # check max pairwise distance
+                img = batch
+                logging.info(img.shape)
+                idx_perm = torch.randperm(img.shape[0])
+                dist = torch.sqrt(torch.sum((img - img[idx_perm]) ** 2, dim=(1, 2, 3)))
+                logging.info(dist.shape)
+                logging.info(dist.max())
+                continue
+
         if step == 0:
             logging.info(batch.shape)
         batch = scaler(batch)
@@ -203,7 +250,7 @@ def train(config, workdir):
 
         # Report the loss on an evaluation dataset periodically
         if step % config.training.eval_freq == 0:
-            if use_new_dataloader:
+            if use_laplacenet_dataloader:
                 images, labels = next(eval_iter)
                 eval_batch = images.to(config.device)
             else:
@@ -222,11 +269,12 @@ def train(config, workdir):
             save_step = step // config.training.snapshot_freq
             save_checkpoint(os.path.join(checkpoint_dir, f'checkpoint_{save_step}.pth'), state)
 
-            encoder_state = state['model'].module.encoder.state_dict()
-            torch.save(encoder_state, os.path.join(checkpoint_enc_dir, f'encoder_state_{save_step}.pth'))
+            if getattr(config.training, 'include_encoder', False):
+                encoder_state = state['model'].module.encoder.state_dict()
+                torch.save(encoder_state, os.path.join(checkpoint_enc_dir, f'encoder_state_{save_step}.pth'))
 
             # Generate and save samples
-            if config.training.snapshot_sampling:
+            if config.training.snapshot_sampling and step > 0:
                 ema.store(score_model.parameters())
                 ema.copy_to(score_model.parameters())
                 sample, n = sampling_fn(score_model)
@@ -238,7 +286,7 @@ def train(config, workdir):
                 sample = np.clip(sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
                 with tf.io.gfile.GFile(
                         os.path.join(this_sample_dir, "sample.np"), "wb") as fout:
-                    np.save(fout, sample)
+                    np.save(fout, image_grid.cpu().numpy()) # sample)
 
                 with tf.io.gfile.GFile(
                         os.path.join(this_sample_dir, "sample.png"), "wb") as fout:
@@ -257,7 +305,7 @@ def evaluate(config,
         "eval".
     """
     # Create directory to eval_folder
-    eval_dir = os.path.join(workdir, eval_folder)
+    eval_dir = os.path.join(workdir, f'{eval_folder}_{config.training.experiment_name}')
     tf.io.gfile.makedirs(eval_dir)
 
     # Build data pipeline
@@ -275,7 +323,7 @@ def evaluate(config,
     ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
     state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
 
-    checkpoint_dir = os.path.join(workdir, "checkpoints")
+    checkpoint_dir = os.path.join(workdir, f"checkpoints_{config.training.experiment_name}")
 
     # Setup SDEs
     if config.training.sde.lower() == 'vpsde':
@@ -356,6 +404,30 @@ def evaluate(config,
                 time.sleep(120)
                 state = restore_checkpoint(ckpt_path, state, device=config.device)
         ema.copy_to(score_model.parameters())
+
+        """
+        # create plots for analysis of learned representation
+        if getattr(config.training, 'include_encoder', False):
+            probabilistic_encoder = getattr(config.training, 'probabilistic_encoder', False)
+            for ds_str in ['eval', 'train']:
+                ds = eval_ds if ds_str == 'eval' else train_ds
+                ds_iter = iter(ds)
+                info = defaultdict(list)
+                for i, batch in enumerate(ds_iter):
+                    images, labels = batch
+                    eval_batch = images.to(config.device)
+                    eval_batch = scaler(eval_batch)
+                    score_fn = mutils.get_score_fn(sde, state['model'], train=False, continuous=True)
+                    eps = 1e-5
+                    t = torch.rand(batch.shape[0], device=batch.device) * (sde.T - eps) + eps
+                    model_result = score_fn(eval_batch * 0., t, x0=eval_batch)
+                    latent = model_result['latent'] if not probabilistic_encoder else model_result['z_mean']
+                    info['z'].append(latent.cpu().numpy())
+                    info['label'].append(labels)
+                info['z'] = np.concatenate(info['z'], dim=0)
+                info['label'] = np.concatenate(info['label'], dim=0)
+        """
+
         # Compute the loss function on the full evaluation dataset if loss computation is enabled
         if config.eval.enable_loss:
             all_losses = []

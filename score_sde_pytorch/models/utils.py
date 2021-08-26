@@ -171,7 +171,11 @@ def get_score_fn(sde, model, train=False, continuous=False):
                 labels = torch.round(labels).long()
 
             score = model_fn(x, labels, x0=x0, t=t)
-            return score
+            if not train:
+                for v in score.values():
+                    if hasattr(v, 'detach'):
+                        v.detach_()
+            return score  # {k: v.detach() if not train and hasattr(v, 'detach') else v for k, v in score.items()}
 
     else:
         raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")

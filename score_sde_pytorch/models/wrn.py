@@ -48,7 +48,7 @@ class wide_basic(nn.Module):
 
 
 class Wide_ResNet(nn.Module):
-    def __init__(self, depth, widen_factor, dropout_rate, num_classes, latent_dim):
+    def __init__(self, depth, widen_factor, dropout_rate, num_classes, latent_dim, prob_enc=False):
         super(Wide_ResNet, self).__init__()
         self.in_planes = 16
 
@@ -59,6 +59,8 @@ class Wide_ResNet(nn.Module):
         print('| Wide-Resnet %dx%d' % (depth, k))
         nStages = [16, 16 * k, 32 * k, 64 * k]
 
+        self.prob_enc = prob_enc
+
         self.time_embedding = timeembedding.TimeEmbedding()
         temb_dim = self.time_embedding.temb_dim
 
@@ -67,8 +69,9 @@ class Wide_ResNet(nn.Module):
         self.layer2 = self._wide_layer(wide_basic, nStages[2], n, dropout_rate, stride=2, temb_dim=temb_dim)
         self.layer3 = self._wide_layer(wide_basic, nStages[3], n, dropout_rate, stride=2, temb_dim=temb_dim)
         self.bn1 = nn.BatchNorm2d(nStages[3], momentum=0.9)
-        # self.linear_latent = nn.Linear(nStages[3], latent_dim)
         assert latent_dim == nStages[3]
+        if self.prob_enc:
+            self.linear_latent = nn.Linear(nStages[3], latent_dim * 2)
         self.linear = nn.Linear(nStages[3], num_classes)
 
     def _wide_layer(self, block, planes, num_blocks, dropout_rate, stride, temb_dim=None):
@@ -96,16 +99,18 @@ class Wide_ResNet(nn.Module):
         out = F.avg_pool2d(out, out.shape[-2])
         out = out.view(out.size(0), -1)
         out_resnet = out
-        # z = self.linear_latent(out)
         z = out
+        if self.prob_enc:
+            z = self.linear_latent(z)
         clf_out = self.linear(out)
         return clf_out, out_resnet, z
 
 
-def build_wideresnet(depth, widen_factor, dropout, num_classes, latent_dim):
+def build_wideresnet(depth, widen_factor, dropout, num_classes, latent_dim, prob_enc):
     logger.info(f"Model: WideResNet {depth}x{widen_factor}")
     return Wide_ResNet(depth=depth,
                        widen_factor=widen_factor,
                        dropout_rate=dropout,
                        num_classes=num_classes,
-                       latent_dim=latent_dim)
+                       latent_dim=latent_dim,
+                       prob_enc=prob_enc)

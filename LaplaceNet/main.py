@@ -162,6 +162,7 @@ def laplacenet():
                 if epoch >= args.max_epochs - 1:
                     break
 
+    print(epoch_results[-40:, :2], file=sys.stderr)
     logging.info('Finished')
 
 

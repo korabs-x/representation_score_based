@@ -20,6 +20,7 @@ import torch.nn as nn
 import functools
 import torch
 import numpy as np
+import torch.autograd.functional as af
 import sys
 
 ResnetBlockDDPM = layerspp.ResnetBlockDDPMpp
@@ -86,16 +87,18 @@ class NCSNpp(nn.Module):
         embed_out_dim_tembonly = nf * 4
         embed_out_dim = embed_out_dim_tembonly
         include_encoder = getattr(self.config.training, 'include_encoder', False)
+        prob_enc = getattr(self.config.training, 'probabilistic_encoder', False)
         if include_encoder:
             widen_factor = 2
             latent_dim = 64 * widen_factor
-            self.encoder = wrn.build_wideresnet(28, widen_factor, 0, 10, latent_dim)
+            self.encoder = wrn.build_wideresnet(28, widen_factor, 0, 10, latent_dim, prob_enc)
             self.latent_to_temb = nn.Linear(latent_dim, embed_out_dim_tembonly)
             embed_out_dim *= 2
             self.low_res_image_size = int(self.config.data.image_size // (2 ** (self.num_resolutions - 1)))
             self.z_dec_1 = nn.Linear(embed_out_dim, self.nf * 2 * self.low_res_image_size)
             self.z_dec_2 = nn.Linear(self.nf * 2 * self.low_res_image_size, self.nf * 2 * self.low_res_image_size)
-            self.z_dec_3 = nn.Linear(self.nf * 2 * self.low_res_image_size, self.nf * 2 * self.low_res_image_size * self.low_res_image_size)
+            self.z_dec_3 = nn.Linear(self.nf * 2 * self.low_res_image_size,
+                                     self.nf * 2 * self.low_res_image_size * self.low_res_image_size)
             self.decoder = Decoder(self.config)
 
         if conditional:
@@ -249,170 +252,207 @@ class NCSNpp(nn.Module):
         self.all_modules = nn.ModuleList(modules)
 
     def forward(self, x, time_cond, x0=None, t=None):
-        # timestep/noise_level embedding; only for continuous training
-        modules = self.all_modules
-        m_idx = 0
-        if self.embedding_type == 'fourier':
-            # Gaussian Fourier features embeddings.
-            used_sigmas = time_cond
-            temb = modules[m_idx](torch.log(used_sigmas))
-            m_idx += 1
+        use_constrained_architecture = getattr(self.config.model, 'constrained_architecture', False)
 
-        elif self.embedding_type == 'positional':
-            # Sinusoidal positional embeddings.
-            timesteps = time_cond
-            used_sigmas = self.sigmas[time_cond.long()]
-            temb = layers.get_timestep_embedding(timesteps, self.nf)
+        with torch.enable_grad():
+            xshape = x.shape
+            if use_constrained_architecture:
+                if x.grad is not None:
+                    x.grad.detach_()
+                    x.grad.zero_()
+                # make the flat version a leaf variable
+                x_flat = x.view(x.shape[0], -1).detach()
+                x_flat.requires_grad = True
+                x = x_flat.view(xshape)
 
-        else:
-            raise ValueError(f'embedding type {self.embedding_type} unknown.')
-
-        if self.conditional:
-            temb = modules[m_idx](temb)
-            m_idx += 1
-            temb = modules[m_idx](self.act(temb))
-            m_idx += 1
-        else:
-            temb = None
-
-        # if not self.config.data.centered:
-        #    # If input data is in [0, 1]
-        #    x = 2 * x - 1.
-
-        z = None
-        reconstr = None
-        include_encoder = getattr(self.config.training, 'include_encoder', False)
-        if include_encoder:
-            _, _, z = self.encoder(x=x0, t=t)
-            temb = torch.cat((temb, self.latent_to_temb(z)), dim=-1)
-
-        # Downsampling block
-        input_pyramid = None
-        if self.progressive_input != 'none':
-            input_pyramid = x
-
-        hs = [modules[m_idx](x)]
-        m_idx += 1
-        for i_level in range(self.num_resolutions):
-            # Residual blocks for this resolution
-            for i_block in range(self.num_res_blocks):
-                h = modules[m_idx](hs[-1], temb)
+            # timestep/noise_level embedding; only for continuous training
+            modules = self.all_modules
+            m_idx = 0
+            if self.embedding_type == 'fourier':
+                # Gaussian Fourier features embeddings.
+                used_sigmas = time_cond
+                temb = modules[m_idx](torch.log(used_sigmas))
                 m_idx += 1
+
+            elif self.embedding_type == 'positional':
+                # Sinusoidal positional embeddings.
+                timesteps = time_cond
+                used_sigmas = self.sigmas[time_cond.long()]
+                temb = layers.get_timestep_embedding(timesteps, self.nf)
+
+            else:
+                raise ValueError(f'embedding type {self.embedding_type} unknown.')
+
+            if self.conditional:
+                temb = modules[m_idx](temb)
+                m_idx += 1
+                temb = modules[m_idx](self.act(temb))
+                m_idx += 1
+            else:
+                temb = None
+
+            # if not self.config.data.centered:
+            #    # If input data is in [0, 1]
+            #    x = 2 * x - 1.
+
+            z = None
+            reconstr = None
+            include_encoder = getattr(self.config.training, 'include_encoder', False)
+            prob_enc = getattr(self.config.training, 'probabilistic_encoder', False)
+            z_mean, z_logvar = None, None
+            if include_encoder:
+                _, _, z = self.encoder(x=x0, t=t)
+                if prob_enc:
+                    z_mean, z_logvar = torch.split(z, z.shape[-1] // 2, dim=-1)
+                    z = z_mean + torch.randn_like(z_logvar) * (0.5 * z_logvar).exp()
+                temb = torch.cat((temb, self.latent_to_temb(z)), dim=-1)
+
+            # Downsampling block
+            input_pyramid = None
+            if self.progressive_input != 'none':
+                input_pyramid = x
+
+            hs = [modules[m_idx](x)]
+
+            m_idx += 1
+            for i_level in range(self.num_resolutions):
+                # Residual blocks for this resolution
+                for i_block in range(self.num_res_blocks):
+                    h = modules[m_idx](hs[-1], temb)
+                    m_idx += 1
+                    if h.shape[-1] in self.attn_resolutions:
+                        h = modules[m_idx](h)
+                        m_idx += 1
+
+                    hs.append(h)
+
+                if i_level != self.num_resolutions - 1:
+                    if self.resblock_type == 'ddpm':
+                        h = modules[m_idx](hs[-1])
+                        m_idx += 1
+                    else:
+                        h = modules[m_idx](hs[-1], temb)
+                        m_idx += 1
+
+                    if self.progressive_input == 'input_skip':
+                        input_pyramid = self.pyramid_downsample(input_pyramid)
+                        h = modules[m_idx](input_pyramid, h)
+                        m_idx += 1
+
+                    elif self.progressive_input == 'residual':
+                        input_pyramid = modules[m_idx](input_pyramid)
+                        m_idx += 1
+                        if self.skip_rescale:
+                            input_pyramid = (input_pyramid + h) / np.sqrt(2.)
+                        else:
+                            input_pyramid = input_pyramid + h
+                        h = input_pyramid
+
+                    hs.append(h)
+
+            if use_constrained_architecture:
+                assert h.requires_grad
+
+            h = hs[-1]
+            if include_encoder:
+                z_dec = temb  # temb includes z
+                z_dec = self.act(self.z_dec_1(z_dec))
+                z_dec = self.act(self.z_dec_2(z_dec))
+                z_dec = self.act(self.z_dec_3(z_dec))
+                z_dec = z_dec.reshape(-1, self.nf * 2, self.low_res_image_size, self.low_res_image_size)
+                reconstr = self.decoder(z_dec, temb=temb)
+                h = torch.cat((h, z_dec), dim=-3)
+            h = modules[m_idx](h, temb)
+            m_idx += 1
+            h = modules[m_idx](h)
+            m_idx += 1
+            h = modules[m_idx](h, temb)
+            m_idx += 1
+
+            pyramid = None
+
+            # Upsampling block
+            for i_level in reversed(range(self.num_resolutions)):
+                for i_block in range(self.num_res_blocks + 1):
+                    h = modules[m_idx](torch.cat([h, hs.pop()], dim=1), temb)
+                    m_idx += 1
+
                 if h.shape[-1] in self.attn_resolutions:
                     h = modules[m_idx](h)
                     m_idx += 1
 
-                hs.append(h)
-
-            if i_level != self.num_resolutions - 1:
-                if self.resblock_type == 'ddpm':
-                    h = modules[m_idx](hs[-1])
-                    m_idx += 1
-                else:
-                    h = modules[m_idx](hs[-1], temb)
-                    m_idx += 1
-
-                if self.progressive_input == 'input_skip':
-                    input_pyramid = self.pyramid_downsample(input_pyramid)
-                    h = modules[m_idx](input_pyramid, h)
-                    m_idx += 1
-
-                elif self.progressive_input == 'residual':
-                    input_pyramid = modules[m_idx](input_pyramid)
-                    m_idx += 1
-                    if self.skip_rescale:
-                        input_pyramid = (input_pyramid + h) / np.sqrt(2.)
+                if self.progressive != 'none':
+                    if i_level == self.num_resolutions - 1:
+                        if self.progressive == 'output_skip':
+                            pyramid = self.act(modules[m_idx](h))
+                            m_idx += 1
+                            pyramid = modules[m_idx](pyramid)
+                            m_idx += 1
+                        elif self.progressive == 'residual':
+                            pyramid = self.act(modules[m_idx](h))
+                            m_idx += 1
+                            pyramid = modules[m_idx](pyramid)
+                            m_idx += 1
+                        else:
+                            raise ValueError(f'{self.progressive} is not a valid name.')
                     else:
-                        input_pyramid = input_pyramid + h
-                    h = input_pyramid
+                        if self.progressive == 'output_skip':
+                            pyramid = self.pyramid_upsample(pyramid)
+                            pyramid_h = self.act(modules[m_idx](h))
+                            m_idx += 1
+                            pyramid_h = modules[m_idx](pyramid_h)
+                            m_idx += 1
+                            pyramid = pyramid + pyramid_h
+                        elif self.progressive == 'residual':
+                            pyramid = modules[m_idx](pyramid)
+                            m_idx += 1
+                            if self.skip_rescale:
+                                pyramid = (pyramid + h) / np.sqrt(2.)
+                            else:
+                                pyramid = pyramid + h
+                            h = pyramid
+                        else:
+                            raise ValueError(f'{self.progressive} is not a valid name')
 
-                hs.append(h)
+                if i_level != 0:
+                    if self.resblock_type == 'ddpm':
+                        h = modules[m_idx](h)
+                        m_idx += 1
+                    else:
+                        h = modules[m_idx](h, temb)
+                        m_idx += 1
 
-        h = hs[-1]
-        if include_encoder:
-            z_dec = temb  # temb includes z
-            z_dec = self.act(self.z_dec_1(z_dec))
-            z_dec = self.act(self.z_dec_2(z_dec))
-            z_dec = self.act(self.z_dec_3(z_dec))
-            z_dec = z_dec.reshape(-1, self.nf * 2, self.low_res_image_size, self.low_res_image_size)
-            reconstr = self.decoder(z_dec, temb=temb)
-            h = torch.cat((h, z_dec), dim=-3)
-        h = modules[m_idx](h, temb)
-        m_idx += 1
-        h = modules[m_idx](h)
-        m_idx += 1
-        h = modules[m_idx](h, temb)
-        m_idx += 1
+            assert not hs
 
-        pyramid = None
-
-        # Upsampling block
-        for i_level in reversed(range(self.num_resolutions)):
-            for i_block in range(self.num_res_blocks + 1):
-                h = modules[m_idx](torch.cat([h, hs.pop()], dim=1), temb)
+            if self.progressive == 'output_skip':
+                h = pyramid
+            else:
+                h = self.act(modules[m_idx](h))
                 m_idx += 1
-
-            if h.shape[-1] in self.attn_resolutions:
                 h = modules[m_idx](h)
                 m_idx += 1
 
-            if self.progressive != 'none':
-                if i_level == self.num_resolutions - 1:
-                    if self.progressive == 'output_skip':
-                        pyramid = self.act(modules[m_idx](h))
-                        m_idx += 1
-                        pyramid = modules[m_idx](pyramid)
-                        m_idx += 1
-                    elif self.progressive == 'residual':
-                        pyramid = self.act(modules[m_idx](h))
-                        m_idx += 1
-                        pyramid = modules[m_idx](pyramid)
-                        m_idx += 1
-                    else:
-                        raise ValueError(f'{self.progressive} is not a valid name.')
-                else:
-                    if self.progressive == 'output_skip':
-                        pyramid = self.pyramid_upsample(pyramid)
-                        pyramid_h = self.act(modules[m_idx](h))
-                        m_idx += 1
-                        pyramid_h = modules[m_idx](pyramid_h)
-                        m_idx += 1
-                        pyramid = pyramid + pyramid_h
-                    elif self.progressive == 'residual':
-                        pyramid = modules[m_idx](pyramid)
-                        m_idx += 1
-                        if self.skip_rescale:
-                            pyramid = (pyramid + h) / np.sqrt(2.)
-                        else:
-                            pyramid = pyramid + h
-                        h = pyramid
-                    else:
-                        raise ValueError(f'{self.progressive} is not a valid name')
+            assert m_idx == len(modules)
 
-            if i_level != 0:
-                if self.resblock_type == 'ddpm':
-                    h = modules[m_idx](h)
-                    m_idx += 1
-                else:
-                    h = modules[m_idx](h, temb)
-                    m_idx += 1
+            if use_constrained_architecture:
+                # x_flat = x.view(x.shape[0], -1)
+                h_flat = h.view(h.shape[0], -1)
+                # vjp = torch.autograd.grad(outputs=h_flat, inputs=(x_flat,), grad_outputs=x_flat - h_flat, create_graph=True)[0]
+                create_graph = True
+                strict = True
+                outputs = (h_flat,)
+                inputs = x_flat
+                v = (x_flat - h_flat,)
+                grad_res = af._autograd_grad(outputs, inputs, v, create_graph=create_graph)
+                vjp = af._fill_in_zeros(grad_res, inputs, strict, create_graph, "back")
+                score_flat = (x_flat - h_flat) - vjp[0]
+                h = score_flat.view(h.shape)
 
-        assert not hs
+            if self.config.model.scale_by_sigma or use_constrained_architecture:
+                used_sigmas = used_sigmas.reshape((x.shape[0], *([1] * len(x.shape[1:]))))
+                h = h / used_sigmas
 
-        if self.progressive == 'output_skip':
-            h = pyramid
-        else:
-            h = self.act(modules[m_idx](h))
-            m_idx += 1
-            h = modules[m_idx](h)
-            m_idx += 1
-
-        assert m_idx == len(modules)
-        if self.config.model.scale_by_sigma:
-            used_sigmas = used_sigmas.reshape((x.shape[0], *([1] * len(x.shape[1:]))))
-            h = h / used_sigmas
-
-        return {'output': h, 'latent': z, 'reconstr': reconstr}
+        return {'output': h, 'latent': z, 'reconstr': reconstr, 'z_mean': z_mean, 'z_logvar': z_logvar}
 
 
 class Decoder(nn.Module):

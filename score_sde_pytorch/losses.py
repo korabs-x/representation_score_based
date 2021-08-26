@@ -23,6 +23,7 @@ from models import utils as mutils
 from sde_lib import VESDE, VPSDE
 import logging
 
+
 def get_optimizer(config, params):
     """Returns a flax optimizer object based on `config`."""
     if config.optim.optimizer == 'Adam':
@@ -85,7 +86,18 @@ def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_we
         z = torch.randn_like(batch)
         mean, std = sde.marginal_prob(batch, t)
         perturbed_data = mean + std[:, None, None, None] * z
-        model_result = score_fn(perturbed_data, t, x0=batch)
+
+        x0_input = batch
+        loss_weight = 1.0
+        apply_mixup = getattr(config.training, 'apply_mixup', False)
+        if apply_mixup:
+            alpha = 1.0
+            lam = torch.from_numpy(np.random.beta(alpha, alpha, batch.shape[0]).astype(np.float32)).to(batch.device)
+            index = torch.randperm(batch.shape[0], device=batch.device)
+            x0_input = lam[:, None, None, None] * batch + (1. - lam[:, None, None, None]) * batch[index, :]
+            loss_weight = 2 * lam
+
+        model_result = score_fn(perturbed_data, t, x0=x0_input)
         score = model_result['output']
 
         if not likelihood_weighting:
@@ -96,14 +108,43 @@ def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_we
             losses = torch.square(score + z / std[:, None, None, None])
             losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1) * g2
 
+        losses *= loss_weight
+
+        losses_reg = 0 * losses
+        if config.training.lambda_z > 0.0:
+            if config.training.probabilistic_encoder:
+                mu, log_var = model_result['z_mean'], model_result['z_logvar']
+                kl = -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=-1)
+                losses_reg += config.training.lambda_z * kl
+                if not train:
+                    logging.info(f'avg abs mean {mu.absolute().mean()}, avg std {(0.5 * log_var).exp().mean()}')
+            else:
+                losses_reg += config.training.lambda_z * torch.sum(torch.abs(model_result['latent']), dim=-1)
+
         if config.training.lambda_reconstr != 0.0:
-            losses_reconstr = torch.square(model_result['reconstr'] - batch)
+            # losses_reconstr = torch.square(model_result['reconstr'] - batch)
+            if not config.data.dataset == 'cifar10':
+                raise Exception(f'AE loss not supported for dataset {config.data.dataset}')
+
+            def inverse_normalize(tensor, c_mean=[0.4914, 0.4822, 0.4465], c_std=[0.2470, 0.2435, 0.2616]):
+                c_mean = torch.as_tensor(c_mean, dtype=tensor.dtype, device=tensor.device)
+                c_std = torch.as_tensor(c_std, dtype=tensor.dtype, device=tensor.device)
+                if c_mean.ndim == 1:
+                    c_mean = c_mean.view(-1, 1, 1)
+                if c_std.ndim == 1:
+                    c_std = c_std.view(-1, 1, 1)
+                # tensor.mul_(c_std).add_(c_mean)
+                return tensor * c_std + c_mean
+
+            batch_orig_scale = inverse_normalize(batch)
+            losses_reconstr = torch.nn.BCEWithLogitsLoss(reduction='none')(model_result['reconstr'], batch_orig_scale)
             losses_reconstr = reduce_op(losses_reconstr.reshape(losses_reconstr.shape[0], -1), dim=-1)
             if config.training.lambda_reconstr < 0.0:
                 losses = losses * 0 + losses_reconstr
             else:
                 losses += config.training.lambda_reconstr * losses_reconstr
 
+        losses += losses_reg
         loss = torch.mean(losses)
         return loss
 
@@ -157,7 +198,8 @@ def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
     return loss_fn
 
 
-def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False, config=None):
+def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False,
+                config=None):
     """Create a one-step training/evaluation function.
 
     Args:
@@ -207,12 +249,20 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
             state['step'] += 1
             state['ema'].update(model.parameters())
         else:
-            with torch.no_grad():
+            use_constrained_architecture = getattr(config.model, 'constrained_architecture', False)
+            if use_constrained_architecture:
                 ema = state['ema']
                 ema.store(model.parameters())
                 ema.copy_to(model.parameters())
                 loss = loss_fn(model, batch)
                 ema.restore(model.parameters())
+            else:
+                with torch.no_grad():
+                    ema = state['ema']
+                    ema.store(model.parameters())
+                    ema.copy_to(model.parameters())
+                    loss = loss_fn(model, batch)
+                    ema.restore(model.parameters())
 
         return loss
 

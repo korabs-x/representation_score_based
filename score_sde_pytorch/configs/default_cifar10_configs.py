@@ -9,8 +9,8 @@ def get_default_configs():
     # training
     config.training = training = ml_collections.ConfigDict()
     config.training.batch_size = 64
-    training.n_iters = 100000  # 1300001
-    training.snapshot_freq = 10000
+    training.n_iters = 70000  # 1300001
+    training.snapshot_freq = 70000
     training.log_freq = 50
     training.eval_freq = 100
     ## store additional checkpoints for preemption in cloud computing environments
@@ -22,8 +22,11 @@ def get_default_configs():
     training.reduce_mean = False
     training.experiment_name = ''
     training.lambda_reconstr = 0.0
+    training.apply_mixup = False
 
     training.include_encoder = False
+    training.probabilistic_encoder = False
+    training.lambda_z = 0.0
 
     # sampling
     config.sampling = sampling = ml_collections.ConfigDict()
@@ -61,6 +64,7 @@ def get_default_configs():
     model.beta_max = 20.
     model.dropout = 0.1
     model.embedding_type = 'fourier'
+    model.constrained_architecture = False
 
     # optimization
     config.optim = optim = ml_collections.ConfigDict()
